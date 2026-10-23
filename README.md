@@ -17,10 +17,10 @@ Digging into the Bluetooth logs showed the pairing was fine. The TV just wasn't 
 
 On boot, a small foreground service starts and, for the remote's Bluetooth address:
 
-- **Passive auto-connect:** keeps a `connectGatt(autoConnect = true)` request open, so Android connects as soon as the remote advertises.
-- **HID host connect:** asks the system HID host profile to connect the remote as an input device. This uses a hidden API via reflection, which is why `hidden_api_policy` is relaxed.
-- **Targeted BLE scan:** watches for the remote's advertisement and immediately triggers a connect.
-- **Re-arming:** it re-arms after disconnects, after Bluetooth toggles, and from a check every 60 seconds.
+- **Passive auto-connect:** keeps one `connectGatt(autoConnect = true, TRANSPORT_LE, PHY_LE_1M)` client open so the controller can accept the remote as soon as it advertises. This client is not torn down on a timer. `BluetoothGatt.connect()` is never called on it (that call is a *direct* connect in AOSP and drops the accept-list entry after it times out).
+- **HID host connect:** asks the system HID host profile to connect the remote as an input device. Hidden `BluetoothHidHost` APIs need `BLUETOOTH_PRIVILEGED` and are tried once, then disabled after `SecurityException`.
+- **BLE scan:** while HID is down, scans with OR-filters on the bonded address, the name `AR`, and the HID service UUID (`00001812-0000-1000-8000-00805f9b34fb`). Low-latency for 60s after boot or a disconnect, then balanced for 10 minutes, then low-power. Directed advertisements still may never reach the app scanner — the armed GATT client is the path that catches those.
+- **Re-arming:** a dead GATT client (disconnect / failed status) is closed and a new autoConnect client is armed. ACL/HID disconnect only replaces GATT if that client was actually connected. A 60s watchdog only arms a missing client; it does not cancel a pending background connection.
 - **Lost bond:** if the pairing is ever lost, it starts re-pairing and opens Bluetooth settings.
 
 Everything is logged under the `RemoteHelper` tag.

@@ -18,23 +18,24 @@ public class RemoteService extends Service {
     static final String DEFAULT_ADDR = "F3:4F:12:BF:58:8A";
     static final int HID_HOST = 4;
     static final String ACTION_HID_STATE = "android.bluetooth.input.profile.action.CONNECTION_STATE_CHANGED";
-    static final long BOOT_WINDOW_MS = 10 * 60 * 1000L;
 
     private final Handler h = new Handler(Looper.getMainLooper());
     private BluetoothAdapter adapter;
     private BluetoothDevice device;
     private String address;
     private BluetoothGatt gatt;
+    private ReconnectPolicy.GattPhase gattPhase = ReconnectPolicy.GattPhase.NONE;
+    private int gattGeneration;
     private BluetoothProfile hidProxy;
     private BluetoothLeScanner scanner;
-    private boolean scanning; private int scanMode = -1;
+    private boolean scanning;
+    private int scanMode = -1;
     private long startedAt;
+    private long lastWakeHint;
     private long lastKick;
     private boolean receiverRegistered;
-    private boolean hidReflectDisabled; // set after SecurityException (BLUETOOTH_PRIVILEGED)
-    private long lastHardRearm;
-    static final long HARD_REARM_MS = 5 * 60 * 1000L;
-    private final Runnable rearmTask = () -> hardRearm("scheduled");
+    private boolean hidReflectDisabled;
+    private boolean foregroundOk;
 
     static String getAddress(Context c) {
         return c.getSharedPreferences("cfg", MODE_PRIVATE).getString("address", DEFAULT_ADDR);
@@ -51,7 +52,12 @@ public class RemoteService extends Service {
     @Override public void onCreate() {
         super.onCreate();
         startedAt = SystemClock.elapsedRealtime();
-        goForeground();
+        lastWakeHint = startedAt;
+        foregroundOk = goForeground();
+        if (!foregroundOk) {
+            stopSelf();
+            return;
+        }
         adapter = ((BluetoothManager) getSystemService(BLUETOOTH_SERVICE)).getAdapter();
         IntentFilter f = new IntentFilter();
         f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
@@ -59,12 +65,16 @@ public class RemoteService extends Service {
         f.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
         f.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         f.addAction(ACTION_HID_STATE);
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(rx, f, Context.RECEIVER_EXPORTED); else registerReceiver(rx, f);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(rx, f, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(rx, f);
+        }
         receiverRegistered = true;
         Log.i(TAG, "service created, SDK " + Build.VERSION.SDK_INT);
     }
 
-    private void goForeground() {
+    private boolean goForeground() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(new NotificationChannel("rh", "Remote Helper", NotificationManager.IMPORTANCE_MIN));
         Notification n = new Notification.Builder(this, "rh").setContentTitle("Remote Helper")
@@ -73,15 +83,20 @@ public class RemoteService extends Service {
         try {
             if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
             else startForeground(1, n);
-        } catch (Exception e) { Log.e(TAG, "startForeground failed (permissions granted?)", e); }
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "startForeground failed (permissions granted?)", e);
+            return false;
+        }
     }
 
     @Override public int onStartCommand(Intent i, int flags, int id) {
+        if (!foregroundOk) return START_NOT_STICKY;
         String a = i != null ? i.getStringExtra(EXTRA_ADDRESS) : null;
         if (a != null && BluetoothAdapter.checkBluetoothAddress(a.toUpperCase(Locale.US))) {
             getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("address", a.toUpperCase(Locale.US)).apply();
             Log.i(TAG, "address set to " + a);
-            if (gatt != null) { gatt.close(); gatt = null; }
+            releaseGatt("address-changed");
             stopScan();
         }
         Log.i(TAG, "onStartCommand reason=" + (i != null ? i.getStringExtra("reason") : "restart"));
@@ -95,14 +110,18 @@ public class RemoteService extends Service {
         address = getAddress(this);
         try { device = adapter.getRemoteDevice(address); } catch (Exception e) { Log.e(TAG, "bad address " + address, e); return; }
         boolean bonded = false;
-        try { for (BluetoothDevice d : adapter.getBondedDevices()) if (d.getAddress().equalsIgnoreCase(address)) { device = d; bonded = true; } }
-        catch (SecurityException e) { Log.e(TAG, "BLUETOOTH_CONNECT not granted", e); return; }
-        Log.i(TAG, "target " + address + " name=" + safeName() + " bonded=" + bonded + " bondState=" + device.getBondState());
+        try {
+            for (BluetoothDevice d : adapter.getBondedDevices()) {
+                if (d.getAddress().equalsIgnoreCase(address)) { device = d; bonded = true; }
+            }
+        } catch (SecurityException e) { Log.e(TAG, "BLUETOOTH_CONNECT not granted", e); return; }
+        Log.i(TAG, "target " + address + " name=" + safeName() + " bonded=" + bonded
+                + " bondState=" + device.getBondState() + " gattPhase=" + gattPhase);
         if (hidProxy == null) {
             boolean ok = adapter.getProfileProxy(this, proxyListener, HID_HOST);
             Log.i(TAG, "getProfileProxy(HID_HOST) requested=" + ok);
         }
-        armGatt();
+        applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.SETUP), "setup");
         startScan();
         h.removeCallbacks(periodic);
         h.postDelayed(periodic, 60_000);
@@ -110,57 +129,103 @@ public class RemoteService extends Service {
 
     private String safeName() { try { return device.getName(); } catch (Exception e) { return "?"; } }
 
-    // Strategy A: passive autoConnect GATT
-    private void armGatt() {
-        if (gatt != null || device == null) return;
-        try {
-            gatt = device.connectGatt(this, true, gattCb, BluetoothDevice.TRANSPORT_LE);
-            Log.i(TAG, "A: connectGatt(autoConnect=true) armed: " + (gatt != null));
-        } catch (Exception e) { Log.e(TAG, "A: connectGatt failed", e); }
+    private boolean hidConnected() {
+        return hidState() == BluetoothProfile.STATE_CONNECTED;
     }
 
-    private void hardRearm(String why) {
-        Log.i(TAG, "watchdog re-arm (" + why + ")");
-        if (gatt != null) {
-            try { gatt.disconnect(); } catch (Exception ignored) {}
-            try { gatt.close(); } catch (Exception ignored) {}
-            gatt = null;
+    private void applyGattAction(ReconnectPolicy.GattAction action, String why) {
+        switch (action) {
+            case ARM:
+                armGatt(why);
+                break;
+            case REPLACE:
+                replaceGatt(why);
+                break;
+            case RELEASE:
+                releaseGatt(why);
+                break;
+            case KEEP:
+            default:
+                break;
         }
-        lastHardRearm = SystemClock.elapsedRealtime();
-        armGatt();
-        startScan();
     }
 
-    private void scheduleRearm(String why) {
-        Log.i(TAG, "re-arm scheduled in 1s (" + why + ")");
-        h.removeCallbacks(rearmTask);
-        h.postDelayed(rearmTask, 1000);
+    private boolean adapterOn() {
+        return adapter != null && adapter.isEnabled();
     }
 
-    private void kickGatt() {
-        // direct (fast) connect attempt in addition to the background one
+    private void armGatt(String why) {
+        if (gatt != null || device == null) return;
+        if (!adapterOn()) {
+            Log.w(TAG, "A: skip arm (" + why + "), adapter off");
+            return;
+        }
         try {
-            if (gatt != null) { boolean r = gatt.connect(); Log.i(TAG, "A: gatt.connect() -> " + r); }
-            else armGatt();
-        } catch (Exception e) { Log.e(TAG, "A: kick failed", e); }
+            int gen = ++gattGeneration;
+            gatt = device.connectGatt(this, true, gattCb, BluetoothDevice.TRANSPORT_LE,
+                    BluetoothDevice.PHY_LE_1M, h);
+            gattPhase = ReconnectPolicy.GattPhase.PENDING;
+            Log.i(TAG, "A: connectGatt(autoConnect=true, PHY_1M) armed gen=" + gen + " why=" + why + " ok=" + (gatt != null));
+            if (gatt == null) gattPhase = ReconnectPolicy.GattPhase.NONE;
+        } catch (Exception e) {
+            gattPhase = ReconnectPolicy.GattPhase.NONE;
+            Log.e(TAG, "A: connectGatt failed (" + why + ")", e);
+        }
+    }
+
+    private void replaceGatt(String why) {
+        Log.i(TAG, "A: replace GATT (" + why + ")");
+        releaseGatt(why);
+        h.removeCallbacks(armLater);
+        h.postDelayed(armLater, 300);
+    }
+
+    private final Runnable armLater = () -> {
+        armGatt("delayed");
+        startScan();
+    };
+
+    private void releaseGatt(String why) {
+        h.removeCallbacks(armLater);
+        BluetoothGatt g = gatt;
+        gatt = null;
+        gattPhase = ReconnectPolicy.GattPhase.NONE;
+        gattGeneration++;
+        if (g != null) {
+            try { g.close(); } catch (Exception ignored) {}
+            Log.i(TAG, "A: GATT closed (" + why + ")");
+        }
     }
 
     private final BluetoothGattCallback gattCb = new BluetoothGattCallback() {
         @Override public void onConnectionStateChange(BluetoothGatt g, int status, int newState) {
-            Log.i(TAG, "A: GATT state status=" + status + " newState=" + newState);
-            if (newState == BluetoothProfile.STATE_DISCONNECTED || status != BluetoothGatt.GATT_SUCCESS) {
-                h.post(() -> {
-                    try { g.close(); } catch (Exception ignored) {}
-                    if (g == gatt) gatt = null;
-                    scheduleRearm("gatt status=" + status + " newState=" + newState);
-                });
-            } else if (newState == BluetoothProfile.STATE_CONNECTED) {
-                h.post(() -> hidConnect("gatt-connected"));
-            }
+            final int gen = gattGeneration;
+            h.post(() -> handleGattState(g, gen, status, newState));
         }
     };
 
-    // Strategy B: hidden BluetoothHidHost.connect via reflection
+    private void handleGattState(BluetoothGatt g, int gen, int status, int newState) {
+        Log.i(TAG, "A: GATT state status=" + status + " newState=" + newState
+                + " phase=" + gattPhase + " gen=" + gen + "/" + gattGeneration);
+        if (g != gatt || !ReconnectPolicy.isCurrentClient(gen, gattGeneration)) {
+            try { g.close(); } catch (Exception ignored) {}
+            return;
+        }
+        if (newState == BluetoothProfile.STATE_CONNECTED) {
+            gattPhase = ReconnectPolicy.GattPhase.CONNECTED;
+            hidConnect("gatt-connected");
+            return;
+        }
+        if (ReconnectPolicy.isGattDead(newState, status)) {
+            lastWakeHint = SystemClock.elapsedRealtime();
+            ReconnectPolicy.Event ev = (status != BluetoothGatt.GATT_SUCCESS)
+                    ? ReconnectPolicy.Event.GATT_FAILED : ReconnectPolicy.Event.GATT_DISCONNECTED;
+            applyGattAction(ReconnectPolicy.gattAction(gattPhase, ev),
+                    "gatt status=" + status + " newState=" + newState);
+            startScan();
+        }
+    }
+
     private final BluetoothProfile.ServiceListener proxyListener = new BluetoothProfile.ServiceListener() {
         @Override public void onServiceConnected(int profile, BluetoothProfile proxy) {
             hidProxy = proxy;
@@ -174,7 +239,7 @@ public class RemoteService extends Service {
     private int hidState() {
         try { return hidProxy != null ? hidProxy.getConnectionState(device) : -1; } catch (Exception e) { return -2; }
     }
-    private void logHidState() { Log.i(TAG, "B: HID state=" + hidState()); }
+    private void logHidState() { Log.i(TAG, "B: HID state=" + hidState() + " gattPhase=" + gattPhase); }
 
     private void hidConnect(String why) {
         if (hidProxy == null || device == null) { Log.w(TAG, "B: hidConnect(" + why + ") skipped, proxy=" + hidProxy); return; }
@@ -201,44 +266,69 @@ public class RemoteService extends Service {
         return false;
     }
 
-    // Strategy C: filtered BLE scan
     private void startScan() {
-        if (adapter == null || !adapter.isEnabled() || address == null) return;
-        if (hidState() == BluetoothProfile.STATE_CONNECTED) { stopScan(); return; }
-        int mode = (SystemClock.elapsedRealtime() - startedAt < BOOT_WINDOW_MS) ? ScanSettings.SCAN_MODE_BALANCED : ScanSettings.SCAN_MODE_LOW_POWER;
+        if (!ReconnectPolicy.shouldScan(hidConnected(), adapter != null && adapter.isEnabled())) {
+            stopScan();
+            return;
+        }
+        if (address == null) return;
+        long now = SystemClock.elapsedRealtime();
+        int mode = ReconnectPolicy.scanMode(false, now - startedAt, now - lastWakeHint);
         if (scanning && mode == scanMode) return;
         stopScan();
         scanner = adapter.getBluetoothLeScanner();
         if (scanner == null) { Log.w(TAG, "C: no LE scanner"); return; }
         try {
-            List<ScanFilter> filters = Collections.singletonList(new ScanFilter.Builder().setDeviceAddress(address).build());
+            List<ScanFilter> filters = Arrays.asList(
+                    new ScanFilter.Builder().setDeviceAddress(address).build(),
+                    new ScanFilter.Builder().setDeviceName(ReconnectPolicy.TARGET_NAME).build(),
+                    new ScanFilter.Builder().setServiceUuid(ParcelUuid.fromString(ReconnectPolicy.HID_SERVICE_UUID)).build());
             ScanSettings s = new ScanSettings.Builder().setScanMode(mode)
-                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES).setReportDelay(0).build();
+                    .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                    .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
+                    .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
+                    .setReportDelay(0).build();
             scanner.startScan(filters, s, scanCb);
-            scanning = true; scanMode = mode;
-            Log.i(TAG, "C: scan started mode=" + mode);
+            scanning = true;
+            scanMode = mode;
+            Log.i(TAG, "C: scan started mode=" + mode + " filters=address|name=AR|HID");
         } catch (Exception e) { Log.e(TAG, "C: startScan failed (BLUETOOTH_SCAN granted?)", e); }
     }
 
     private void stopScan() {
         if (!scanning) return;
         try { if (scanner != null) scanner.stopScan(scanCb); } catch (Exception ignored) {}
-        scanning = false; scanMode = -1;
+        scanning = false;
+        scanMode = -1;
         Log.i(TAG, "C: scan stopped");
     }
 
     private final ScanCallback scanCb = new ScanCallback() {
         @Override public void onScanResult(int type, ScanResult r) { h.post(() -> onSeen(r)); }
         @Override public void onBatchScanResults(List<ScanResult> rs) { for (ScanResult r : rs) h.post(() -> onSeen(r)); }
-        @Override public void onScanFailed(int code) { Log.e(TAG, "C: scan failed code=" + code); scanning = false; h.postDelayed(RemoteService.this::startScan, 5000); }
+        @Override public void onScanFailed(int code) {
+            Log.e(TAG, "C: scan failed code=" + code);
+            h.post(() -> {
+                try { if (scanner != null) scanner.stopScan(scanCb); } catch (Exception ignored) {}
+                scanning = false;
+                scanMode = -1;
+                h.postDelayed(RemoteService.this::startScan, 5000);
+            });
+        }
     };
 
     private void onSeen(ScanResult r) {
+        BluetoothDevice d = r.getDevice();
+        String name;
+        try { name = d.getName(); } catch (Exception e) { name = null; }
+        if (!ReconnectPolicy.isTargetAdvertisement(address, d.getAddress(), name, d.getBondState() == BluetoothDevice.BOND_BONDED)) {
+            return;
+        }
         long now = SystemClock.elapsedRealtime();
         if (now - lastKick < 1500) return;
         lastKick = now;
-        BluetoothDevice d = r.getDevice();
-        Log.i(TAG, "C: remote advertising rssi=" + r.getRssi() + " bond=" + d.getBondState());
+        Log.i(TAG, "C: remote advertising addr=" + d.getAddress() + " name=" + name
+                + " rssi=" + r.getRssi() + " bond=" + d.getBondState());
         if (d.getBondState() == BluetoothDevice.BOND_NONE) {
             Log.w(TAG, "bond missing -> createBond() = " + d.createBond());
             try {
@@ -246,17 +336,21 @@ public class RemoteService extends Service {
             } catch (Exception e) { Log.w(TAG, "could not open BT settings: " + e); }
             return;
         }
-        device = d;
+        if (address != null && address.equalsIgnoreCase(d.getAddress())) {
+            device = d;
+        }
         hidConnect("adv-seen");
-        kickGatt();
+        applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.SCAN_SEEN), "adv-seen");
     }
 
     private final Runnable periodic = new Runnable() {
         @Override public void run() {
             logHidState();
-            if (hidState() != BluetoothProfile.STATE_CONNECTED) {
-                boolean overdue = SystemClock.elapsedRealtime() - lastHardRearm >= HARD_REARM_MS;
-                hardRearm(overdue ? "periodic 5min hard" : "periodic 60s");
+            if (!adapterOn()) {
+                Log.i(TAG, "periodic: adapter off, not arming");
+            } else {
+                applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.PERIODIC), "periodic");
+                startScan();
             }
             h.postDelayed(this, 60_000);
         }
@@ -268,33 +362,57 @@ public class RemoteService extends Service {
             if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(a)) {
                 int s = i.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1);
                 Log.i(TAG, "adapter state " + s);
-                if (s == BluetoothAdapter.STATE_ON) setup();
-                if (s == BluetoothAdapter.STATE_OFF) { scanning = false; if (gatt != null) { gatt.close(); gatt = null; } }
+                if (s == BluetoothAdapter.STATE_ON) {
+                    lastWakeHint = SystemClock.elapsedRealtime();
+                    releaseGatt("bt-on");
+                    setup();
+                } else if (s == BluetoothAdapter.STATE_OFF) {
+                    applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.BT_OFF), "bt-off");
+                    stopScan();
+                }
                 return;
             }
-            BluetoothDevice d = i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            BluetoothDevice d = extraDevice(i);
             if (d == null || address == null || !address.equalsIgnoreCase(d.getAddress())) return;
             if (ACTION_HID_STATE.equals(a)) {
                 int s = i.getIntExtra(BluetoothProfile.EXTRA_STATE, -1);
-                Log.i(TAG, "HID state changed -> " + s);
-                if (s == BluetoothProfile.STATE_CONNECTED) stopScan();
-                else if (s == BluetoothProfile.STATE_DISCONNECTED) scheduleRearm("hid-state-0");
+                Log.i(TAG, "HID state changed -> " + s + " phase=" + gattPhase);
+                if (s == BluetoothProfile.STATE_CONNECTED) {
+                    applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.HID_CONNECTED), "hid-connected");
+                    stopScan();
+                } else if (s == BluetoothProfile.STATE_DISCONNECTED) {
+                    lastWakeHint = SystemClock.elapsedRealtime();
+                    applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.HID_DISCONNECTED), "hid-disconnected");
+                    startScan();
+                }
             } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(a)) {
-                Log.i(TAG, "ACL connected"); h.postDelayed(() -> hidConnect("acl-connected"), 500);
+                Log.i(TAG, "ACL connected");
+                h.postDelayed(() -> hidConnect("acl-connected"), 500);
             } else if (BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(a)) {
-                Log.i(TAG, "ACL disconnected -> re-arm"); scheduleRearm("acl-disconnected");
+                Log.i(TAG, "ACL disconnected phase=" + gattPhase);
+                lastWakeHint = SystemClock.elapsedRealtime();
+                applyGattAction(ReconnectPolicy.gattAction(gattPhase, ReconnectPolicy.Event.ACL_DISCONNECTED), "acl-disconnected");
+                startScan();
             } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(a)) {
                 Log.i(TAG, "bond state -> " + i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1));
             }
         }
     };
 
+    private static BluetoothDevice extraDevice(Intent i) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            return i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+        }
+        return i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+    }
+
     @Override public void onDestroy() {
         Log.w(TAG, "service destroyed");
         h.removeCallbacksAndMessages(null);
         stopScan();
-        if (gatt != null) gatt.close();
-        if (hidProxy != null) adapter.closeProfileProxy(HID_HOST, hidProxy);
+        releaseGatt("destroy");
+        if (hidProxy != null && adapter != null) adapter.closeProfileProxy(HID_HOST, hidProxy);
+        hidProxy = null;
         if (receiverRegistered) unregisterReceiver(rx);
         super.onDestroy();
     }
