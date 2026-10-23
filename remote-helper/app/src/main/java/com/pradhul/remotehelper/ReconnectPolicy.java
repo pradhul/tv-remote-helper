@@ -55,14 +55,12 @@ final class ReconnectPolicy {
 
     /**
      * A GATT client is dead only after a disconnect. A non-success status on
-     * STATE_CONNECTED must not tear down a live link.
+     * STATE_CONNECTED / STATE_CONNECTING must not tear down a client that is
+     * still moving; wait for STATE_DISCONNECTED.
      */
     static boolean isGattDead(int newState, int status) {
         final int stateDisconnected = 0;
-        final int stateConnected = 2;
-        if (newState == stateDisconnected) return true;
-        if (newState == stateConnected) return false;
-        return status != 0;
+        return newState == stateDisconnected;
     }
 
     static boolean isCurrentClient(int callbackGeneration, int currentGeneration) {

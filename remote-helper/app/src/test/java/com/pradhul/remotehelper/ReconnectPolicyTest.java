@@ -66,6 +66,7 @@ public class ReconnectPolicyTest {
         assertFalse(ReconnectPolicy.isGattDead(/*connected*/ 2, /*success*/ 0));
         assertFalse(ReconnectPolicy.isGattDead(/*connected*/ 2, /*odd status*/ 133));
         assertFalse(ReconnectPolicy.isGattDead(/*connecting*/ 1, /*success*/ 0));
+        assertFalse(ReconnectPolicy.isGattDead(/*connecting*/ 1, /*error*/ 133));
     }
 
     @Test
